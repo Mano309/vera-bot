@@ -270,6 +270,23 @@ composer = VeraComposer()
 # ============================================================================
 
 
+@app.get("/")
+async def root():
+    """Welcome page."""
+    return {
+        "message": "Vera AI Challenge Bot",
+        "status": "running",
+        "endpoints": {
+            "healthz": "GET /v1/healthz",
+            "metadata": "GET /v1/metadata",
+            "context": "POST /v1/context",
+            "tick": "POST /v1/tick",
+            "reply": "POST /v1/reply"
+        },
+        "docs": "https://github.com/Mano309/vera-bot"
+    }
+
+
 @app.get("/v1/healthz")
 async def healthz():
     """Liveness probe."""
