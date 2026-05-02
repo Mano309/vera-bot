@@ -22,16 +22,20 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
+# Load environment variables from .env file
+load_dotenv()
+
 # Try to import LLM provider; fallback to mock if not available
 try:
-    from anthropic import Anthropic
-    HAS_ANTHROPIC = True
+    from openai import OpenAI
+    HAS_OPENAI = True
 except ImportError:
-    HAS_ANTHROPIC = False
+    HAS_OPENAI = False
 
 # ============================================================================
 # DATA MODELS
@@ -111,13 +115,13 @@ You must respond with ONLY a valid JSON object with no extra text or markdown, c
 }
 """
 
-    def __init__(self, model: str = "claude-3-5-sonnet-20241022"):
+    def __init__(self, model: str = "gpt-4o-mini"):
         self.model = model
         self.client = None
-        if HAS_ANTHROPIC:
-            api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if HAS_OPENAI:
+            api_key = os.getenv("OPENAI_API_KEY", "")
             if api_key:
-                self.client = Anthropic(api_key=api_key)
+                self.client = OpenAI(api_key=api_key)
 
     def compose(
         self,
@@ -132,14 +136,16 @@ You must respond with ONLY a valid JSON object with no extra text or markdown, c
 
         if self.client:
             try:
-                response = self.client.messages.create(
+                response = self.client.chat.completions.create(
                     model=self.model,
                     max_tokens=1000,
                     temperature=0,  # Deterministic
-                    system=self.SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=[
+                        {"role": "system", "content": self.SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
                 )
-                text = response.content[0].text.strip()
+                text = response.choices[0].message.content.strip()
                 return self._parse_response(text)
             except Exception as e:
                 print(f"LLM error: {e}")
@@ -284,8 +290,8 @@ async def metadata():
     return {
         "team_name": "Solo Participant",
         "team_members": ["AI Assistant"],
-        "model": "claude-3-5-sonnet-20241022",
-        "approach": "Single LLM-powered composer with context dispatch by trigger.kind + fallback heuristics",
+        "model": "gpt-4o-mini (OpenAI)",
+        "approach": "OpenAI-powered composer with context dispatch by trigger.kind + fallback heuristics",
         "contact_email": "challenge@magicpin.com",
         "version": "1.0.0",
         "submitted_at": datetime.utcnow().isoformat() + "Z",
