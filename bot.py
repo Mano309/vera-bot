@@ -715,6 +715,11 @@ async def reply(body: ReplyBody):
         }
 
     if has_negative_intent(normalized_message):
+        # Suppress this merchant-customer pair from future messaging
+        merchant_id = body.merchant_id or meta.get("merchant_id")
+        customer_id = body.customer_id or meta.get("customer_id")
+        if merchant_id and customer_id:
+            suppressed.add((merchant_id, customer_id))
         return {
             "action": "end",
             "body": "Understood — I’ll stop messaging on this thread.",
