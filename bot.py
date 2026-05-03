@@ -216,6 +216,22 @@ You must respond with ONLY a valid JSON object with no extra text or markdown, c
                 labels.append(label)
         return labels[:3]
 
+    def _detect_auto_reply(self, text: str) -> bool:
+        lowered = self._clean_text(text).lower()
+        if not lowered:
+            return False
+        canned_patterns = [
+            r"thank you for contacting",
+            r"our team will respond shortly",
+            r"we will respond shortly",
+            r"we'll respond shortly",
+            r"i will get back to you shortly",
+            r"auto.?reply",
+        ]
+        if any(re.search(pattern, lowered) for pattern in canned_patterns):
+            return True
+        return lowered.startswith("thank you") and "respond" in lowered and "shortly" in lowered
+
     def _looks_generic(
         self,
         message: ComposedMessage,
@@ -412,6 +428,42 @@ Use concrete numbers, dates, names, and one clear CTA. Return valid JSON only.
             rationale=rationale,
             template_name="vera_grounded_v1",
             template_params=template_params,
+        )
+
+    def _build_customer_confirmation(self, meta: Dict[str, Any], message_text: str) -> str:
+        customer_id = meta.get("customer_id")
+        customer_ctx = contexts.get(("customer", customer_id), {}).get("payload", {}) if customer_id else {}
+        customer_name = self._first_nonempty(customer_ctx.get("identity", {}).get("name"), default="there")
+
+        merchant_id = meta.get("merchant_id")
+        merchant_ctx = contexts.get(("merchant", merchant_id), {}).get("payload", {}) if merchant_id else {}
+        merchant_name = self._first_nonempty(merchant_ctx.get("identity", {}).get("name"), default="your clinic")
+
+        trigger_id = meta.get("trigger_id")
+        trigger_ctx = contexts.get(("trigger", trigger_id), {}).get("payload", {}) if trigger_id else {}
+        trigger_payload = trigger_ctx.get("payload", trigger_ctx) if isinstance(trigger_ctx, dict) else {}
+        slot_labels = self._slot_labels(trigger_payload)
+
+        selected_slot = ""
+        normalized_message = self._clean_text(message_text).lower()
+        if slot_labels and normalized_message.isdigit():
+            slot_index = int(normalized_message) - 1
+            if 0 <= slot_index < len(slot_labels):
+                selected_slot = slot_labels[slot_index]
+        if not selected_slot:
+            for label in slot_labels:
+                if label.lower() in normalized_message:
+                    selected_slot = label
+                    break
+        if not selected_slot:
+            slot_match = re.search(r"\b(?:mon|tue|tues|wed|thu|thur|fri|sat|sun|today|tomorrow)\b[^.?!]*", message_text, re.I)
+            selected_slot = slot_match.group(0).strip().rstrip(".,;:") if slot_match else (slot_labels[0] if slot_labels else "the selected slot")
+
+        service_due = self._clean_text(trigger_payload.get("service_due", trigger_ctx.get("kind", "follow-up")))
+        due_date = self._clean_text(trigger_payload.get("due_date", "soon"))
+        return (
+            f"Thanks, {customer_name}. I’ve locked in {selected_slot} for {service_due} at {merchant_name}. "
+            f"Your reminder is due around {due_date}. If you want to change anything, send the new time and I’ll update it."
         )
 
     def _fallback_compose(
@@ -622,40 +674,8 @@ async def reply(body: ReplyBody):
         ]
         return any(re.search(pattern, text) for pattern in patterns)
 
-    def build_customer_confirmation(meta: Dict[str, Any], message_text: str) -> str:
-        customer_id = meta.get("customer_id")
-        customer_ctx = contexts.get(("customer", customer_id), {}).get("payload", {}) if customer_id else {}
-        customer_name = customer_ctx.get("identity", {}).get("name", "there")
-        trigger_id = meta.get("trigger_id")
-        trigger_ctx = contexts.get(("trigger", trigger_id), {}).get("payload", {}) if trigger_id else {}
-        slot_labels = []
-        for slot in trigger_ctx.get("available_slots", []) or []:
-            label = slot.get("label") or slot.get("iso")
-            if label:
-                slot_labels.append(str(label))
-        for slot in trigger_ctx.get("next_session_options", []) or []:
-            label = slot.get("label") or slot.get("iso")
-            if label:
-                slot_labels.append(str(label))
-        slot_hint = ""
-        if slot_labels:
-            lowered_message = message_text.lower()
-            for label in slot_labels:
-                if label.lower() in lowered_message:
-                    slot_hint = label
-                    break
-            if not slot_hint:
-                slot_hint = slot_labels[0]
-        if not slot_hint:
-            slot_match = re.search(r"\b(?:mon|tue|tues|wed|thu|thur|fri|sat|sun|today|tomorrow)\b[^.?!]*", message_text, re.I)
-            slot_hint = slot_match.group(0).strip().rstrip(".,;:") if slot_match else (message_text.strip() or "the selected slot")
-        return (
-            f"Thanks, {customer_name}. I’ve noted your confirmation for {slot_hint}. "
-            "If you want to change anything, send the new time and I’ll update it."
-        )
-
     normalized_message = normalize(body.message)
-    merchant_key = body.merchant_id or body.conversation_id
+    merchant_key = body.merchant_id or conversation_meta.get(body.conversation_id, {}).get("merchant_id") or "global"
     memory_key = (merchant_key, body.from_role, normalized_message)
     state = reply_memory.get(memory_key, {"count": 0, "last_turn": 0})
     state["count"] = state.get("count", 0) + 1
@@ -664,12 +684,32 @@ async def reply(body: ReplyBody):
 
     meta = conversation_meta.get(body.conversation_id, {})
 
-    if state["count"] >= 3:
+    if body.from_role == "merchant" and composer._detect_auto_reply(body.message):
+        if state["count"] == 1:
+            return {
+                "action": "wait",
+                "wait_seconds": 14400,
+                "rationale": "Detected merchant auto-reply (canned 'Thank you for contacting' phrasing). Backing off 4 hours to wait for owner.",
+            }
+        if state["count"] == 2:
+            return {
+                "action": "wait",
+                "wait_seconds": 86400,
+                "rationale": "Same auto-reply twice in a row; waiting longer for a real merchant response.",
+            }
         return {
             "action": "end",
             "body": "Thanks — I’m stopping here so this thread doesn’t loop. Reach out when you want to continue.",
             "cta": "none",
             "rationale": "Repeated identical reply detected across turns; ending to prevent auto-reply loops.",
+        }
+
+    if state["count"] >= 3:
+        return {
+            "action": "end",
+            "body": "Thanks — I’m stopping here so this thread doesn’t loop. Reach out when you want to continue.",
+            "cta": "none",
+            "rationale": "Repeated identical reply detected across turns; ending to prevent reply loops.",
         }
 
     if has_negative_intent(normalized_message):
@@ -680,10 +720,14 @@ async def reply(body: ReplyBody):
             "rationale": "Clear opt-out or negative intent detected.",
         }
 
-    if body.from_role == "customer" and has_positive_intent(normalized_message):
+    if body.from_role == "customer" and (
+        has_positive_intent(normalized_message)
+        or normalized_message.isdigit()
+        or bool(re.search(r"\b(?:wed|thu|fri|sat|sun|mon|tue|tues|today|tomorrow)\b", normalized_message))
+    ):
         return {
             "action": "send",
-            "body": build_customer_confirmation(meta, body.message),
+            "body": composer._build_customer_confirmation(meta, body.message),
             "cta": "none",
             "rationale": "Customer confirmed or asked to proceed; replying with a concrete confirmation.",
         }
@@ -708,7 +752,7 @@ async def reply(body: ReplyBody):
         if re.search(r"\b(wed|thu|fri|sat|sun|mon|tue|tues|today|tomorrow)\b.*\b(\d{1,2}\s*(?:am|pm)|\d{1,2}:\d{2}\s*(?:am|pm)?)", normalized_message) or re.search(r"\bbook|schedule|confirm\b", normalized_message):
             return {
                 "action": "send",
-                "body": build_customer_confirmation(meta, body.message),
+                "body": composer._build_customer_confirmation(meta, body.message),
                 "cta": "none",
                 "rationale": "Customer message looks like a scheduling confirmation; responding with a concrete acknowledgment.",
             }
