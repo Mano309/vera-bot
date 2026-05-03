@@ -440,8 +440,10 @@ Use concrete numbers, dates, names, and one clear CTA. Return valid JSON only.
         merchant_name = self._first_nonempty(merchant_ctx.get("identity", {}).get("name"), default="your clinic")
 
         trigger_id = meta.get("trigger_id")
-        trigger_ctx = contexts.get(("trigger", trigger_id), {}).get("payload", {}) if trigger_id else {}
-        trigger_payload = trigger_ctx.get("payload", trigger_ctx) if isinstance(trigger_ctx, dict) else {}
+        trigger_stored = contexts.get(("trigger", trigger_id), {}) if trigger_id else {}
+        trigger_obj = trigger_stored.get("payload", {}) if trigger_stored else {}
+        nested_payload = trigger_obj.get("payload", {}) if isinstance(trigger_obj, dict) and "payload" in trigger_obj else {}
+        trigger_payload = nested_payload if nested_payload else trigger_obj
         slot_labels = self._slot_labels(trigger_payload)
 
         selected_slot = ""
@@ -459,7 +461,7 @@ Use concrete numbers, dates, names, and one clear CTA. Return valid JSON only.
             slot_match = re.search(r"\b(?:mon|tue|tues|wed|thu|thur|fri|sat|sun|today|tomorrow)\b[^.?!]*", message_text, re.I)
             selected_slot = slot_match.group(0).strip().rstrip(".,;:") if slot_match else (slot_labels[0] if slot_labels else "the selected slot")
 
-        service_due = self._clean_text(trigger_payload.get("service_due", trigger_ctx.get("kind", "follow-up")))
+        service_due = self._clean_text(trigger_payload.get("service_due", trigger_obj.get("kind", "follow-up") if isinstance(trigger_obj, dict) else "follow-up"))
         due_date = self._clean_text(trigger_payload.get("due_date", "soon"))
         return (
             f"Thanks, {customer_name}. I’ve locked in {selected_slot} for {service_due} at {merchant_name}. "
